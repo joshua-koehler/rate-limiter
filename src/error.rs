@@ -57,6 +57,10 @@ pub enum GatewayError {
     /// unhealthy or Open, so there is nothing to proxy to → 503.
     #[error("all upstream targets are unhealthy")]
     AllTargetsUnhealthy,
+    /// Cross-cutting body cap (lands with P2 retry buffering): the request body
+    /// exceeds the maximum the gateway will buffer → 413.
+    #[error("request body too large")]
+    PayloadTooLarge,
 }
 
 impl GatewayError {
@@ -77,6 +81,7 @@ impl GatewayError {
             GatewayError::Unauthorized => StatusCode::UNAUTHORIZED,
             GatewayError::CircuitOpen { .. } => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::AllTargetsUnhealthy => StatusCode::SERVICE_UNAVAILABLE,
+            GatewayError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
 
@@ -93,6 +98,7 @@ impl GatewayError {
             // additionally carries `retry_after` via the custom body below.
             GatewayError::CircuitOpen { .. } => "service_unavailable",
             GatewayError::AllTargetsUnhealthy => "service_unavailable",
+            GatewayError::PayloadTooLarge => "payload_too_large",
         }
     }
 
