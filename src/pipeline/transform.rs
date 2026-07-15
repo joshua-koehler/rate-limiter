@@ -3,12 +3,11 @@
 //! Three concerns live here because both the request and response transformers
 //! need them, and co-locating keeps `$request_time`/`$response_time` formatting
 //! identical across the two:
-//!   * [`now_rfc3339`] / [`format_rfc3339_utc`] — a hand-rolled RFC-3339 UTC
-//!     timestamp. We format it ourselves (civil-from-days) rather than pull in a
-//!     date crate: it keeps the "build the gateway from scratch" boundary crisp
-//!     and the algorithm is tiny and well-tested below. The caller computes the
-//!     timestamp **once** per request/response and threads it, so a header and a
-//!     body mapping that both reference `$request_time` always agree.
+//!   * [`now_rfc3339`] / [`format_rfc3339_utc`] — an RFC-3339 UTC timestamp
+//!     formatted via the `time` crate (a date utility library, not a gateway
+//!     framework, so the transport-only boundary is intact). The caller computes
+//!     the timestamp **once** per request/response and threads it, so a header
+//!     and a body mapping that both reference `$request_time` always agree.
 //!   * [`resolve_value`] — turn a config value spec (`$literal:…`,
 //!     `$request_time`/`$response_time`, or a plain literal) into a concrete
 //!     string. Used for header `add` values in both directions.
@@ -18,6 +17,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
+use time::macros::format_description;
+use time::OffsetDateTime;
 
 /// Format a [`SystemTime`] as RFC-3339 / ISO-8601 UTC at second precision:
 /// `YYYY-MM-DDTHH:MM:SSZ`. Times before the Unix epoch (which never occur for
@@ -28,35 +29,17 @@ pub fn format_rfc3339_utc(t: SystemTime) -> String {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-    let (year, month, day) = civil_from_days(days);
-
-    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
+    let fmt = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+    OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|dt| dt.format(&fmt).ok())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
 /// `SystemTime::now()` formatted as RFC-3339 UTC. Call **once** per
 /// request/response and reuse the string for every placeholder in that phase.
 pub fn now_rfc3339() -> String {
     format_rfc3339_utc(SystemTime::now())
-}
-
-/// Convert a count of days since 1970-01-01 into a `(year, month, day)` civil
-/// date (Howard Hinnant's `civil_from_days`, valid for the full range we care
-/// about). `month` is 1..=12, `day` is 1..=31.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m as u32, d as u32)
 }
 
 /// Resolve a config value spec into a concrete string:

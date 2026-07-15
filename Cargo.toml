@@ -20,6 +20,10 @@ serde_yaml = "0.9"
 # A data-format library, not an HTTP/proxy framework — the transport-only
 # boundary is intact.
 serde_json = "1"
+# RFC-3339 UTC timestamp formatting for $request_time/$response_time. A
+# date/time utility library, not an HTTP/proxy framework — the transport-only
+# boundary is intact.
+time = { version = "0.3", features = ["formatting", "macros"] }
 thiserror = "2"
 anyhow = "1"
 # Object-safe async trait methods, so the pipeline can hold a per-route
