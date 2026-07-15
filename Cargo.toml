@@ -18,3 +18,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2"
 anyhow = "1"
+# Object-safe async trait methods, so the pipeline can hold a per-route
+# `Vec<Arc<dyn Stage>>` and `await` each stage. A utility macro, not a
+# gateway/proxy framework — the "hyper only as transport" boundary is intact.
+async-trait = "0.1"

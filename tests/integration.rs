@@ -112,6 +112,53 @@ async fn wrong_method_returns_405_with_allow_header() {
     assert_eq!(allowed.status, 200);
 }
 
+#[tokio::test]
+async fn forwards_host_of_upstream_authority() {
+    // P0.3 proxying: the gateway rewrites the `Host` header to the *upstream*
+    // authority (host:port), not its own listen host. The mock echoes the
+    // received Host back as `x-echo-host`.
+    let mock = spawn_mock_upstream().await;
+    let port = free_port();
+    let gw = spawn_gateway(&basic_config(port, &mock), port).await;
+    let client = common::client();
+
+    // Mock authority is the URL with the scheme prefix stripped.
+    let authority = mock.strip_prefix("http://").unwrap();
+
+    let resp = get(&client, &gw.url("/api/echo")).await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.header("x-echo-host").as_deref(),
+        Some(authority),
+        "Host should be rewritten to the upstream authority"
+    );
+}
+
+#[tokio::test]
+async fn segment_boundary_non_match_returns_404() {
+    // P0.3 route matching: prefix matches are segment-bounded, so `/api/users`
+    // must NOT match `/api/usersXYZ` at the HTTP level -> 404.
+    let mock = spawn_mock_upstream().await;
+    let port = free_port();
+    let cfg = format!(
+        r#"
+gateway:
+  port: {port}
+routes:
+  - path: "/api/users"
+    methods: ["GET"]
+    strip_prefix: false
+    upstream:
+      url: "{mock}"
+"#
+    );
+    let gw = spawn_gateway(&cfg, port).await;
+    let client = common::client();
+
+    let resp = get(&client, &gw.url("/api/usersXYZ")).await;
+    assert_eq!(resp.status, 404, "segment-boundary non-match should be 404");
+}
+
 /// Overlapping prefixes with disjoint methods let us prove *which* route was
 /// selected purely from the status code.
 fn overlap_config(port: u16, mock: &str) -> String {

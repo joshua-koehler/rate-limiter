@@ -8,10 +8,11 @@ mod config;
 mod error;
 mod health;
 mod pipeline;
-mod proxy;
+mod rate_limit;
 mod router;
 mod server;
 mod state;
+mod upstream;
 
 use std::path::PathBuf;
 

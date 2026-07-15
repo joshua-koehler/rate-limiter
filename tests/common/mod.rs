@@ -96,8 +96,9 @@ pub async fn get(client: &TestClient, url: &str) -> TestResponse {
 ///
 /// Request knobs: `x-mock-status: <code>` sets the response status (default
 /// 200); `x-mock-sleep-ms: <millis>` adds delay (default 0; for P1 tests).
-/// Response always carries `x-upstream: mock-upstream`, `x-echo-method`, and
-/// `x-echo-path`, with the body echoing the request body (or `mock-upstream-ok`).
+/// Response always carries `x-upstream: mock-upstream`, `x-echo-method`,
+/// `x-echo-path`, and `x-echo-host` (the incoming `Host` header), with the body
+/// echoing the request body (or `mock-upstream-ok`).
 pub async fn spawn_mock_upstream() -> String {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -125,6 +126,12 @@ async fn mock_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_default();
+    let host = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let status = req
         .headers()
         .get("x-mock-status")
@@ -161,6 +168,7 @@ async fn mock_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .header("x-upstream", "mock-upstream")
         .header("x-echo-method", method)
         .header("x-echo-path", path)
+        .header("x-echo-host", host)
         .body(Full::new(echo))
         .unwrap();
     Ok(resp)
