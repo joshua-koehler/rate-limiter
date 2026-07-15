@@ -89,13 +89,23 @@ impl GatewayError {
             .status(status)
             .header(header::CONTENT_TYPE, "application/json");
         if let GatewayError::MethodNotAllowed { allow } = &self {
-            builder = builder.header(header::ALLOW, allow.clone());
+            // `allow` derives from config-supplied method strings; guard against
+            // illegal header bytes so a bad config can never panic a request.
+            if let Ok(value) = header::HeaderValue::from_str(allow) {
+                builder = builder.header(header::ALLOW, value);
+            }
         }
         if let GatewayError::RateLimited { retry_after } = &self {
             builder = builder.header(header::RETRY_AFTER, retry_after.to_string());
         }
-        builder
-            .body(full(body))
-            .expect("error response is always well-formed")
+        builder.body(full(body)).unwrap_or_else(|_| {
+            // All header values above are static or validated, so this is
+            // effectively unreachable; fall back to a bare status response
+            // rather than panicking if that ever changes.
+            Response::builder()
+                .status(status)
+                .body(full("{\"error\":\"internal\"}"))
+                .expect("status-only response with no custom headers is infallible")
+        })
     }
 }

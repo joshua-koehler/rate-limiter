@@ -90,9 +90,14 @@ pub async fn handle(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    // /health — always 200, never routed/authed/rate-limited.
+    // /health — always available, never routed/authed/rate-limited. GET only
+    // (spec: `GET /health`); other methods get 405 rather than a health body.
     if path == "/health" {
-        let resp = health::health_response(&state);
+        let resp = if method == Method::GET {
+            health::health_response(&state)
+        } else {
+            GatewayError::method_not_allowed(&["GET".to_string()]).into_response()
+        };
         access_log(&method, &path, "-", resp.status(), start);
         return resp;
     }

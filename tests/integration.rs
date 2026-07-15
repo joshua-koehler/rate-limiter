@@ -54,6 +54,21 @@ async fn health_endpoint_returns_expected_shape() {
 }
 
 #[tokio::test]
+async fn non_get_health_returns_405() {
+    // Spec: `GET /health`. A non-GET must not receive a health body; it gets a
+    // 405 with the Allow header, and never falls through to a configured route.
+    let mock = spawn_mock_upstream().await;
+    let port = free_port();
+    let gw = spawn_gateway(&basic_config(port, &mock), port).await;
+    let client = common::client();
+
+    let resp = send(&client, Method::POST, &gw.url("/health"), &[], "").await;
+    assert_eq!(resp.status, 405);
+    assert_eq!(resp.header("allow").as_deref(), Some("GET"));
+    assert!(!resp.body_str().contains("healthy"), "body: {}", resp.body_str());
+}
+
+#[tokio::test]
 async fn proxies_and_relays_status_headers_body_faithfully() {
     // P0.3 proxying: status + headers + body all relayed, and method + path are
     // forwarded to the upstream unchanged (P0 forwards the original path).
