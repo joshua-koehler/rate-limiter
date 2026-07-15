@@ -116,7 +116,18 @@ async fn second_config_with_different_routes_and_all_optional_blocks_works() {
     )
     .await;
     assert_eq!(secure.status, 200);
-    assert_eq!(secure.body_str(), "hi");
+    // As of P3 the transforms on this route are live, so this also proves the
+    // request/response transform blocks wire up on a brand-new schema-valid config
+    // with no code changes (P0.5 intent, now covering P3). The response-transform
+    // header is added, and the upstream body ("hi", non-JSON) is embedded as a JSON
+    // string inside the configured envelope.
+    assert_eq!(secure.header("x-served-by").as_deref(), Some("gatewaykit"));
+    let enveloped: serde_json::Value = serde_json::from_slice(&secure.body).unwrap();
+    assert_eq!(enveloped["data"], serde_json::json!("hi"));
+    assert_eq!(
+        enveloped["gateway_metadata"]["route"],
+        serde_json::json!("/secure/data")
+    );
     let unauthed = send(&client, Method::POST, &gw.url("/secure/data"), &[], "hi").await;
     assert_eq!(unauthed.status, 401);
 

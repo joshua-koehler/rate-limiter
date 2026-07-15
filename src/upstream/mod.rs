@@ -66,6 +66,7 @@ pub async fn proxy(ctx: RequestCtx) -> Result<Response<BoxBody>, GatewayError> {
         route_index,
         tail,
         req,
+        request_time,
         ..
     } = ctx;
 
@@ -92,8 +93,30 @@ pub async fn proxy(ctx: RequestCtx) -> Result<Response<BoxBody>, GatewayError> {
     // rebuilds a fresh request from these buffered `Bytes`.
     let (parts, body) = req.into_parts();
     let method = parts.method;
-    let headers = parts.headers;
+    let mut headers = parts.headers;
     let body_bytes = buffer_body(body).await?;
+
+    // P3 — request body mapping. Applied here rather than as a pipeline Stage
+    // because the retry loop already buffers the body once (see module docs);
+    // transforming the buffered bytes in place avoids a second buffering pass and
+    // recomputes `Content-Length` for free (the fresh `Full` body reframes it).
+    // Non-JSON bodies pass through unchanged (`None`); JSON gets the restructured
+    // body plus a `Content-Type: application/json`. `request_time` is the single
+    // per-request timestamp, so a `$request_time` here matches the header stage's.
+    let body_bytes = match route.request_transform.as_ref().and_then(|rt| rt.body.as_ref()) {
+        Some(b) => match crate::pipeline::apply_body_mapping(&body_bytes, &b.mapping, &request_time)
+        {
+            Some(mapped) => {
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                mapped
+            }
+            None => body_bytes,
+        },
+        None => body_bytes,
+    };
 
     // Retry policy + per-attempt timeout (route → upstream → global precedence).
     let retry = route.retry.as_ref();

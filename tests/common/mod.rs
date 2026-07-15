@@ -146,6 +146,21 @@ async fn mock_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
+    // P3 tests need to observe forwarded request headers: reflect every incoming
+    // request header back as `echo-req-<lowercased-name>: <value>`. Non-ASCII
+    // values (whose `to_str()` fails) are skipped to avoid panics. This lets a
+    // test assert that the gateway's request_transform added/removed a header.
+    let echo_req_headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (format!("echo-req-{}", name.as_str().to_lowercase()), v.to_string()))
+        })
+        .collect();
+
     let body = req
         .into_body()
         .collect()
@@ -163,14 +178,22 @@ async fn mock_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         body
     };
 
-    let resp = Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header("x-upstream", "mock-upstream")
         .header("x-echo-method", method)
         .header("x-echo-path", path)
         .header("x-echo-host", host)
-        .body(Full::new(echo))
-        .unwrap();
+        // P3 tests need removable response headers: the gateway's
+        // response_transform strips these in the relevant test.
+        .header("Server", "mock-upstream")
+        .header("X-Powered-By", "mock");
+    // Reflect the incoming request headers (see above) so request-header
+    // add/remove is observable from the client response headers.
+    for (name, value) in echo_req_headers {
+        builder = builder.header(name, value);
+    }
+    let resp = builder.body(Full::new(echo)).unwrap();
     Ok(resp)
 }
 

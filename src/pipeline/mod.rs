@@ -45,6 +45,8 @@ use crate::{health, upstream};
 
 use auth::AuthStage;
 use method::MethodStage;
+use request_transform::RequestTransformStage;
+use response_transform::ResponseTransformStage;
 
 /// Outcome of a stage: either let the request proceed, or terminate it now with
 /// a fully-formed response (a fast rejection or a short-circuit answer).
@@ -78,6 +80,10 @@ pub struct RequestCtx {
     pub client_addr: SocketAddr,
     /// The in-flight request; the terminal upstream call takes its body.
     pub req: Request<Incoming>,
+    /// The request's single RFC-3339 UTC timestamp (P3 `$request_time`), computed
+    /// **once** when the context is built so every use — an added header and a body
+    /// mapping field — resolves to the identical instant (DECISIONS.md).
+    pub request_time: String,
 }
 
 impl RequestCtx {
@@ -157,6 +163,9 @@ pub async fn handle(
         tail: m.tail,
         client_addr,
         req,
+        // Single per-request timestamp shared by the request-transform header
+        // stage and the body mapping (P3), so both agree on `$request_time`.
+        request_time: transform::now_rfc3339(),
     };
 
     // Per-route policy chain. Any stage may short-circuit before upstream work.
@@ -233,10 +242,17 @@ pub fn assemble(config: &Config) -> Vec<Vec<Arc<dyn Stage>>> {
                 stages.push(Arc::new(RateLimitStage));
             }
 
-            // SEAM — later tiers register their stages here, in pipeline order,
-            // gated on the route's config so absent blocks add no overhead:
-            //   if let Some(rt) = &route.request_transform { stages.push(Arc::new(RequestTransform)) }   // P3
-            // (circuit-breaker gate + target selection wrap the terminal call.)
+            // P3 — request header transform (add/remove, $request_time/$literal).
+            // A Stage because it operates on the request head pre-upstream. Pushed
+            // only when the route declares `request_transform.headers`. The request
+            // *body* mapping is NOT a stage: it runs at the body-buffer boundary in
+            // `upstream::proxy` (the retry loop already buffers the body), reading
+            // the same `ctx.request_time` so header and body `$request_time` agree.
+            if let Some(rt) = &route.request_transform {
+                if let Some(h) = &rt.headers {
+                    stages.push(Arc::new(RequestTransformStage::new(h)));
+                }
+            }
 
             stages
         })
@@ -252,12 +268,16 @@ pub fn assemble_response(config: &Config) -> Vec<Vec<Arc<dyn ResponseStage>>> {
     config
         .routes
         .iter()
-        .map(|_route| {
-            let stages: Vec<Arc<dyn ResponseStage>> = Vec::new();
-            // SEAM — P3 response transforms register here, gated on route config:
-            //   if let Some(rt) = &_route.response_transform {
-            //       stages.push(Arc::new(ResponseTransformStage::new(rt)));
-            //   }
+        .map(|route| {
+            let mut stages: Vec<Arc<dyn ResponseStage>> = Vec::new();
+            // P3 — response transform (header add/remove + body envelope). Pushed
+            // only when the route declares `response_transform`; the stage reads the
+            // route's config + `$route_path` from the `ResponseCtx` at apply time.
+            // Runs only on genuine upstream responses (see `run_response_stages`),
+            // so gateway-generated errors are never enveloped (DECISIONS.md).
+            if route.response_transform.is_some() {
+                stages.push(Arc::new(ResponseTransformStage));
+            }
             stages
         })
         .collect()
