@@ -53,8 +53,13 @@ Build in this order; a few features done cleanly beats many half-done.
 
 ## What's next / partial
 - **P0 complete** (as-built above): config load + cross-field validation, `/health`, longest-prefix segment-boundary proxying + 404, method filter (405 + `Allow`), schema-general, pluggable `Stage` pipeline, access logging.
-- **Deferred within cross-cutting:** body-size cap + 413 and `Content-Length` recompute (land with P1 retry / P3 transforms — see Tier-1 as-built).
-- **Not yet built (stub cleanly, never half-wire):** P1 rate limiting / `strip_prefix` / timeouts; P2 auth / retry / breaker / LB / health; P3 transforms. Their config blocks already parse + validate so a full config loads today.
+- **P1 complete:** rate limiting (fixed + sliding window, `per: ip`/`global`, sharded map + atomic-per-bucket check-and-increment proven exact under 50 concurrent requests, background idle-key eviction, 429 + `Retry-After`); `strip_prefix` (segment-tail rewrite, query preserved); per-attempt timeouts (route → upstream → global precedence, 504). Rate limiting is a `RateLimitStage` pushed by `pipeline::assemble` only for routes with an effective limit.
+- **Deferred within cross-cutting:** body-size cap + 413 and `Content-Length` recompute (land with P2 retry / P3 transforms).
+- **Not yet built (stub cleanly, never half-wire):** P2 auth / retry / breaker / LB / health; P3 transforms. Their config blocks already parse + validate so a full config loads today.
+
+## Process notes (tier gates & how the build actually went)
+- **P1 built by two parallel agent teams** on disjoint files (proxy features vs. rate limiting), with shared error variants pre-added so there were no merge conflicts; compilation deferred to tier end per the speed tradeoff.
+- **Mid-P1 architecture refactor (kept, decided by human):** during P1 an agent refactored the P0 pipeline from ordered free-functions into the promised pluggable `Stage`-trait module (`pipeline/`, `upstream/`) and folded it in as "P0 as-built." This overshot its scope and briefly regressed `strip_prefix`/timeouts (re-applied) and required one corrected rate-limit test. **Decision:** keep the `Stage`-trait design — it is exactly the extensibility contract this doc promises (criteria.md's "extend in an afternoon") and rate limiting already builds on it; roll-back would have reopened the docs↔code gap. **Decision:** keep the existing commits and add this honest note rather than rewrite history (nothing was pushed).
 
 ## AI tooling
 Used claude code for the following:

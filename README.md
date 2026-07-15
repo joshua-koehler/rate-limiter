@@ -68,11 +68,11 @@ Organized by priority tier (see [reqs.md](./reqs.md) for the full requirements).
 - [x] Method filtering — disallowed method → `405` with an `Allow` header
 - [x] Schema-general — works with any valid config; no hard-coded paths, ports, or keys
 
-### P1 — High value (planned / next)
+### P1 — High value
 
-- [ ] Rate limiting — global + per-route; `fixed_window` & `sliding_window`; `per: ip` / `per: global`; over-limit → `429` + `Retry-After`
-- [ ] `strip_prefix` — forward the original or prefix-stripped path
-- [ ] Timeouts — global + per-route override; upstream timeout → `504`
+- [x] Rate limiting — global + per-route; `fixed_window` & `sliding_window`; `per: ip` / `per: global`; over-limit → `429` + `Retry-After`; sharded + concurrency-exact; idle-key eviction
+- [x] `strip_prefix` — forward the original or prefix-stripped path (query preserved)
+- [x] Timeouts — global + per-route override; upstream timeout → `504`
 
 ### P2 — Resilience & policy (planned)
 
