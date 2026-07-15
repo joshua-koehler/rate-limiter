@@ -288,6 +288,86 @@ async fn response_envelope_non_json_body() {
 }
 
 #[tokio::test]
+async fn request_time_identical_across_header_and_body() {
+    // The headline consistency claim: `$request_time` is computed once per
+    // request, so a header use and a body-mapping use resolve to the *same* value.
+    // This route uses `$request_time` in both a header AND a body field; the mock
+    // reflects the header (echo-req-*) and echoes the transformed body, so we can
+    // assert the two forwarded values are byte-for-byte equal.
+    let mock = spawn_mock_upstream().await;
+    let port = free_port();
+    let route = format!(
+        r#"  - path: "/rt"
+    methods: ["POST"]
+    strip_prefix: false
+    upstream:
+      url: "{mock}"
+    request_transform:
+      headers:
+        add:
+          X-Request-Start: "$request_time"
+      body:
+        mapping:
+          meta.timestamp: "$request_time""#
+    );
+    let gw = spawn_gateway(&config(port, &route), port).await;
+    let cl = client();
+
+    let resp = send(
+        &cl,
+        Method::POST,
+        &gw.url("/rt"),
+        &[("content-type", "application/json")],
+        r#"{"anything":1}"#,
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+
+    let header_ts = resp
+        .header("echo-req-x-request-start")
+        .expect("header $request_time forwarded");
+    looks_like_rfc3339_utc(&header_ts);
+    let v: Value = serde_json::from_slice(&resp.body).expect("forwarded body is JSON");
+    let body_ts = v["meta"]["timestamp"]
+        .as_str()
+        .expect("body $request_time present");
+    assert_eq!(
+        header_ts, body_ts,
+        "the same request's $request_time must be identical in header and body"
+    );
+}
+
+#[tokio::test]
+async fn upstream_5xx_is_enveloped() {
+    // The load-bearing half of the envelope-vs-error distinction: a *genuine
+    // upstream* 5xx is a real backend response and MUST be enveloped (status
+    // preserved), unlike a gateway-generated error. Drives `x-mock-status: 500`
+    // through an enveloped route and asserts the body is still wrapped.
+    let mock = spawn_mock_upstream().await;
+    let port = free_port();
+    let gw = spawn_gateway(&config(port, &envelope_route(&mock, r#"["POST"]"#)), port).await;
+    let cl = client();
+
+    let resp = send(
+        &cl,
+        Method::POST,
+        &gw.url("/env"),
+        &[("content-type", "application/json"), ("x-mock-status", "500")],
+        r#"{"hello":"world"}"#,
+    )
+    .await;
+    assert_eq!(resp.status, 500, "upstream status is relayed, not masked");
+
+    let v: Value = serde_json::from_slice(&resp.body).expect("enveloped body is JSON");
+    assert_eq!(
+        v["data"],
+        serde_json::json!({"hello": "world"}),
+        "a real upstream 5xx response IS enveloped (unlike gateway errors)"
+    );
+    assert_eq!(v["gateway_metadata"]["route"], "/env");
+}
+
+#[tokio::test]
 async fn envelope_not_applied_to_gateway_errors() {
     // The envelope route only allows GET; a POST is a gateway-generated 405 and
     // must NOT be wrapped — proving the envelope skips gateway errors.

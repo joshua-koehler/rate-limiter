@@ -41,11 +41,21 @@
 //!     the upstream body, which means we have no complete response to send.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use hyper::header::{HeaderName, HeaderValue};
 use http_body_util::BodyExt;
 
 use crate::config::ResponseTransform;
-use crate::error::{full, BoxBody, GatewayError};
+use crate::error::{full, BoxBody, BoxError, GatewayError};
+
+/// Cap on the upstream response body we will buffer to envelope it. Mirrors the
+/// request-side `MAX_BODY_BYTES` DoS guard (`upstream::proxy`): enveloping must
+/// read the whole body into memory, so an unbounded (or hostile/slow-drip)
+/// upstream response would otherwise let a backend OOM the gateway — which would
+/// defeat the request-side cap. 2 MiB comfortably covers JSON API payloads;
+/// larger enveloped responses get a `502` rather than being buffered unbounded.
+/// (Header-only response transforms are unaffected — they leave the body streamed.)
+const MAX_ENVELOPE_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 use super::{ResponseCtx, ResponseStage};
 
@@ -124,14 +134,21 @@ pub async fn apply(
     // `rt.body == None` and `rt.body.envelope == None` mean "no body transform",
     // in which case we fall through and reattach the original streamed body.
     if let Some(ResponseBodyEnvelope(template)) = body_envelope(rt) {
-        // Buffer the upstream body. A read error here is the one case we cannot
-        // paper over: we have no complete body to envelope, so we surface a 502.
-        let bytes = match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
+        // Buffer the upstream body, bounded by MAX_ENVELOPE_BODY_BYTES. Both an
+        // oversize body and a genuine read error are cases we cannot paper over —
+        // we have no complete body to envelope — so we surface a 502 rather than
+        // OOM or send a partial envelope.
+        let bytes = match collect_bounded(body, MAX_ENVELOPE_BODY_BYTES).await {
+            Ok(collected) => collected,
             Err(e) => {
-                eprintln!("response_transform: reading upstream response body failed: {e}");
-                return GatewayError::BadGateway("reading upstream response body".to_string())
-                    .into_response();
+                eprintln!(
+                    "response_transform: upstream response body too large to envelope \
+                     (cap {MAX_ENVELOPE_BODY_BYTES} bytes) or unreadable: {e}"
+                );
+                return GatewayError::BadGateway(
+                    "upstream response body too large or unreadable to envelope".to_string(),
+                )
+                .into_response();
             }
         };
 
@@ -170,6 +187,24 @@ pub async fn apply(
     // No body transform: reattach the original streamed body untouched, carrying
     // only whatever header changes were applied above.
     hyper::Response::from_parts(parts, body)
+}
+
+/// Buffer a response body into `Bytes`, enforcing `cap` as we go so an oversize
+/// upstream body is rejected *without* first reading it all into memory. Mirrors
+/// `upstream::buffer_body` on the request side (same DoS bound), kept here because
+/// only the envelope path buffers the response.
+async fn collect_bounded(mut body: BoxBody, cap: usize) -> Result<Bytes, BoxError> {
+    let mut collected: Vec<u8> = Vec::new();
+    while let Some(next) = body.frame().await {
+        let frame = next?;
+        if let Ok(data) = frame.into_data() {
+            if collected.len() + data.len() > cap {
+                return Err("upstream response body exceeds the envelope buffer cap".into());
+            }
+            collected.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(collected))
 }
 
 /// Newtype so [`body_envelope`] can return the envelope template with a name at

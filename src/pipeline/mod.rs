@@ -7,8 +7,16 @@
 //! startup ([`assemble`]) and iterated in order. Adding a config feature is:
 //!   1. add the config struct (in `config`),
 //!   2. add one file implementing [`Stage`] (in this module),
-//!   3. `push` it in [`assemble`] under the right condition — no change to the
-//!      core loop below.
+//!   3. `push` it in [`assemble`] (request phase) or [`assemble_response`]
+//!      (response phase) under the right condition — no change to the core loop
+//!      below.
+//!
+//! One deliberate exception to "everything registers in `assemble`": request
+//! *body* mapping runs at the body-buffer boundary in `upstream::proxy`, not as a
+//! Stage — a `Stage` operates on the un-buffered `Request<Incoming>`, and you
+//! cannot swap an `Incoming` body for buffered bytes inside `&mut RequestCtx`.
+//! The retry loop already buffers the body once, so mapping it there avoids a
+//! second buffering pass (see `assemble`'s P3 seam and DECISIONS.md).
 //!
 //! Intended full order (later tiers slot stages into `assemble` at the seams):
 //!   route match (selects the chain)  → method → auth → rate limit
@@ -215,8 +223,10 @@ async fn run_response_stages(
 
 /// Assemble each route's stage chain once, at startup, from the parsed config.
 /// The returned outer `Vec` is indexed by route index (parallel to
-/// `config.routes`). **This function is the feature registry** — later tiers add
-/// a `push` per feature here; the core loop in [`handle`] never changes.
+/// `config.routes`). **This is the primary feature registry** for the request
+/// phase — later tiers add a `push` per feature here; the core loop in [`handle`]
+/// never changes. (The one request-side feature that does *not* register here is
+/// body mapping — see the module docs and the P3 seam below.)
 pub fn assemble(config: &Config) -> Vec<Vec<Arc<dyn Stage>>> {
     config
         .routes
