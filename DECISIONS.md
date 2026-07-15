@@ -22,6 +22,13 @@ Build in this order; a few features done cleanly beats many half-done.
 - **Observability:** one structured access-log line per request (route, decision/status, latency, target) + error logging.
 - **Body limits:** cap max body size + read timeout even with transforms stubbed; oversize → 413.
 
+### Tier-1 as-built (where the impl concretizes the plan)
+- **`Stage` trait** via `async-trait` (object-safe async), held as per-route `Vec<Arc<dyn Stage>>` assembled once at startup in `pipeline::assemble` — the single place features register. `Flow = Continue | ShortCircuit(Response)`. `async-trait` is a utility macro, not a gateway framework (transport-only boundary intact).
+- **RequestCtx** lives in `pipeline` (cohesion with the trait), not `server` — minor deviation from the module-map note.
+- **Module layout:** `pipeline/` and `upstream/` are directories (the extensibility surface); `config`/`server`/`health`/`router`/`error` stay single-file modules (churn not worth it yet).
+- **Route match + method:** route match runs *before* the chain (it selects which chain to run); `MethodStage` is the first — and, in P0, only — registered stage.
+- **Deferred to when it has teeth:** body-size cap + 413 needs request-body **buffering**, which is coupled to P1 retry and P3 transform buffering — landing it there avoids committing a buffering design twice. `Content-Length` recompute likewise lands with body transforms (P3); P0 relays the body as a stream so hyper reframes it.
+
 ## Resolved ambiguities (spec silent → our call)
 - **Route match:** **segment-boundary** longest prefix (`/api/users` matches `/api/users` + `/api/users/…`, not `/api/usersXYZ`). Path matched first; method mismatch on the chosen route → 405 (no fallback to a shorter route).
 - **Port:** bind `gateway.port` (literal 8080 in spec is an example, not hard-coded).
@@ -45,7 +52,9 @@ Build in this order; a few features done cleanly beats many half-done.
 `DECISIONS.md` (this) · `README.md` (setup, run, one-command test, feature checklist) · atomic commit-per-tier history narrating build order · self-contained test suite incl. mock upstream (slow + flaky) and the P0.5 alternate-config boot test.
 
 ## What's next / partial
-_(fill in at submission: which P2/P3 features are stubbed and their state.)_
+- **P0 complete** (as-built above): config load + cross-field validation, `/health`, longest-prefix segment-boundary proxying + 404, method filter (405 + `Allow`), schema-general, pluggable `Stage` pipeline, access logging.
+- **Deferred within cross-cutting:** body-size cap + 413 and `Content-Length` recompute (land with P1 retry / P3 transforms — see Tier-1 as-built).
+- **Not yet built (stub cleanly, never half-wire):** P1 rate limiting / `strip_prefix` / timeouts; P2 auth / retry / breaker / LB / health; P3 transforms. Their config blocks already parse + validate so a full config loads today.
 
 ## AI tooling
 Used claude code for the following:

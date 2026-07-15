@@ -164,3 +164,62 @@ fn unparseable_duration_fails_fast() {
     let out = run_binary_expecting_exit(cfg);
     assert!(!out.status.success(), "bad duration should fail fast");
 }
+
+#[test]
+fn duplicate_route_paths_fail_fast() {
+    // P0.5 cross-field: two routes with the same path are ambiguous -> reject.
+    let cfg = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/api"
+    methods: ["GET"]
+    upstream:
+      url: "http://localhost:1"
+  - path: "/api"
+    methods: ["POST"]
+    upstream:
+      url: "http://localhost:2"
+"#;
+    let out = run_binary_expecting_exit(cfg);
+    assert!(!out.status.success(), "duplicate route paths should fail fast");
+}
+
+#[test]
+fn weighted_round_robin_zero_weight_fails_fast() {
+    // P0.5 cross-field: a weighted_round_robin target with weight 0 is invalid.
+    let cfg = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/api"
+    methods: ["GET"]
+    upstream:
+      targets:
+        - url: "http://localhost:1"
+          weight: 1
+        - url: "http://localhost:2"
+          weight: 0
+      balance: "weighted_round_robin"
+"#;
+    let out = run_binary_expecting_exit(cfg);
+    assert!(!out.status.success(), "zero weight should fail fast");
+}
+
+#[test]
+fn balance_without_targets_fails_fast() {
+    // P0.5 cross-field: a balance strategy is meaningless with a single `url`
+    // and no `targets` -> reject.
+    let cfg = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/api"
+    methods: ["GET"]
+    upstream:
+      url: "http://localhost:1"
+      balance: "round_robin"
+"#;
+    let out = run_binary_expecting_exit(cfg);
+    assert!(!out.status.success(), "balance without targets should fail fast");
+}

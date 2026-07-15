@@ -222,6 +222,9 @@ impl Config {
     /// Structural checks that serde can't express (durations/enums are already
     /// validated during deserialization; unknown enum values are rejected there).
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Track normalized paths to reject duplicate routes (which would make
+        // request routing ambiguous).
+        let mut seen_paths: BTreeMap<String, usize> = BTreeMap::new();
         for (i, route) in self.routes.iter().enumerate() {
             let ctx = format!("route[{i}] (path '{}')", route.path);
             if !route.path.starts_with('/') {
@@ -241,8 +244,45 @@ impl Config {
                 }
                 _ => {}
             }
+            let normalized = normalize_path(&route.path);
+            if let Some(prev) = seen_paths.insert(normalized.clone(), i) {
+                anyhow::bail!(
+                    "{ctx}: duplicate route path (collides with route[{prev}] after normalization to '{normalized}')"
+                );
+            }
+            // `balance` load-balances across multiple targets; it's meaningless
+            // (and likely a config mistake) without any.
+            if route.upstream.balance.is_some() && !has_targets {
+                anyhow::bail!("{ctx}: 'balance' requires 'targets'; a single 'url' has nothing to balance");
+            }
+            // Weighted round-robin divides traffic by weight; a zero weight would
+            // starve a target entirely, so it's almost certainly a mistake.
+            if route.upstream.balance == Some(Balance::WeightedRoundRobin) {
+                if !has_targets {
+                    anyhow::bail!("{ctx}: 'weighted_round_robin' requires non-empty 'targets'");
+                }
+                for (j, target) in route.upstream.targets.iter().enumerate() {
+                    if target.weight == 0 {
+                        anyhow::bail!(
+                            "{ctx}: targets[{j}] (url '{}') has weight 0; 'weighted_round_robin' requires weight > 0",
+                            target.url
+                        );
+                    }
+                }
+            }
         }
         Ok(())
+    }
+}
+
+/// Normalize a route path for duplicate detection: trim a trailing '/' so that
+/// e.g. "/api" and "/api/" collide, while the root "/" is preserved as "/".
+fn normalize_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -478,5 +518,105 @@ routes:
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_route_paths() {
+        // "/api" and "/api/" normalize to the same path and must collide.
+        let yaml = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/api"
+    methods: ["GET"]
+    upstream:
+      url: "http://a"
+  - path: "/api/"
+    methods: ["POST"]
+    upstream:
+      url: "http://b"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_weighted_round_robin_with_zero_weight() {
+        let yaml = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/x"
+    methods: ["GET"]
+    upstream:
+      balance: "weighted_round_robin"
+      targets:
+        - url: "http://a"
+          weight: 3
+        - url: "http://b"
+          weight: 0
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_weighted_round_robin_with_positive_weights() {
+        let yaml = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/x"
+    methods: ["GET"]
+    upstream:
+      balance: "weighted_round_robin"
+      targets:
+        - url: "http://a"
+          weight: 3
+        - url: "http://b"
+          weight: 1
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_balance_without_targets() {
+        // `balance` is meaningless over a single `url`.
+        let yaml = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/x"
+    methods: ["GET"]
+    upstream:
+      url: "http://a"
+      balance: "round_robin"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_normal_config() {
+        // Guard against false positives: distinct paths, balanced targets.
+        let yaml = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/api/users"
+    methods: ["GET", "POST"]
+    upstream:
+      url: "http://localhost:3001"
+  - path: "/api/products"
+    methods: ["GET"]
+    upstream:
+      balance: "round_robin"
+      targets:
+        - url: "http://localhost:3003"
+        - url: "http://localhost:3004"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_ok());
     }
 }
