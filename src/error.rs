@@ -44,10 +44,19 @@ pub enum GatewayError {
     /// P1 timeouts: the upstream did not respond within the effective timeout.
     #[error("upstream timed out")]
     GatewayTimeout,
-    // Planned (later tiers), each already fits the into_response() shape:
-    //   Unauthorized                       -> 401  (P2 api_key auth)
-    //   CircuitOpen { retry_after: u64 }    -> 503 envelope (P2)
-    //   AllTargetsUnhealthy                 -> 503  (P2 health checks)
+    /// P2 api_key auth: missing or invalid credential (no 403 distinction —
+    /// see DECISIONS.md).
+    #[error("unauthorized")]
+    Unauthorized,
+    /// P2 circuit breaker: the target's breaker is Open, so we reject without
+    /// contacting upstream. Renders the spec's exact 503 envelope
+    /// `{ "error": "service_unavailable", "retry_after": <s> }`.
+    #[error("circuit open (retry after {retry_after}s)")]
+    CircuitOpen { retry_after: u64 },
+    /// P2 health checks / load balancing: every target for the route is
+    /// unhealthy or Open, so there is nothing to proxy to → 503.
+    #[error("all upstream targets are unhealthy")]
+    AllTargetsUnhealthy,
 }
 
 impl GatewayError {
@@ -65,6 +74,9 @@ impl GatewayError {
             GatewayError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             GatewayError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             GatewayError::GatewayTimeout => StatusCode::GATEWAY_TIMEOUT,
+            GatewayError::Unauthorized => StatusCode::UNAUTHORIZED,
+            GatewayError::CircuitOpen { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            GatewayError::AllTargetsUnhealthy => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -76,6 +88,11 @@ impl GatewayError {
             GatewayError::BadGateway(_) => "bad_gateway",
             GatewayError::RateLimited { .. } => "rate_limited",
             GatewayError::GatewayTimeout => "gateway_timeout",
+            GatewayError::Unauthorized => "unauthorized",
+            // Both 503s speak the spec's `service_unavailable` code; CircuitOpen
+            // additionally carries `retry_after` via the custom body below.
+            GatewayError::CircuitOpen { .. } => "service_unavailable",
+            GatewayError::AllTargetsUnhealthy => "service_unavailable",
         }
     }
 
@@ -84,7 +101,15 @@ impl GatewayError {
     /// so the body is a fixed, injection-safe JSON document.
     pub fn into_response(self) -> Response<BoxBody> {
         let status = self.status();
-        let body = format!("{{\"error\":\"{}\"}}", self.code());
+        // Most errors render `{"error":"<code>"}`; the circuit-breaker 503 adds
+        // the spec's `retry_after` field to the same envelope.
+        let body = match &self {
+            GatewayError::CircuitOpen { retry_after } => format!(
+                "{{\"error\":\"{}\",\"retry_after\":{retry_after}}}",
+                self.code()
+            ),
+            _ => format!("{{\"error\":\"{}\"}}", self.code()),
+        };
         let mut builder = Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json");
