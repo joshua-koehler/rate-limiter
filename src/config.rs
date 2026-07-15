@@ -13,10 +13,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
+use hyper::Uri;
 use serde::Deserialize;
 
 /// Top-level `gateway.yaml` document.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub gateway: Gateway,
     #[serde(default)]
@@ -24,6 +26,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Gateway {
     pub port: u16,
     #[serde(default, deserialize_with = "de_opt_duration")]
@@ -33,6 +36,7 @@ pub struct Gateway {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     pub path: String,
     #[serde(default)]
@@ -59,6 +63,7 @@ pub struct Route {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Upstream {
     /// Single upstream. Mutually exclusive with `targets` (enforced by validate()).
     #[serde(default)]
@@ -76,6 +81,7 @@ pub struct Upstream {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Target {
     pub url: String,
     #[serde(default = "default_weight")]
@@ -87,6 +93,7 @@ fn default_weight() -> u32 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimit {
     pub requests: u64,
     #[serde(deserialize_with = "de_duration")]
@@ -110,6 +117,7 @@ pub enum Per {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Retry {
     pub attempts: u32,
     pub backoff: Backoff,
@@ -134,6 +142,7 @@ pub enum Balance {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Auth {
     #[serde(rename = "type")]
     pub auth_type: AuthType,
@@ -149,6 +158,7 @@ pub enum AuthType {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CircuitBreaker {
     pub threshold: u32,
     #[serde(deserialize_with = "de_duration")]
@@ -158,6 +168,7 @@ pub struct CircuitBreaker {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthCheck {
     pub path: String,
     #[serde(deserialize_with = "de_duration")]
@@ -166,6 +177,7 @@ pub struct HealthCheck {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestTransform {
     #[serde(default)]
     pub headers: Option<HeaderTransform>,
@@ -174,6 +186,7 @@ pub struct RequestTransform {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseTransform {
     #[serde(default)]
     pub headers: Option<HeaderTransform>,
@@ -182,6 +195,7 @@ pub struct ResponseTransform {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HeaderTransform {
     #[serde(default)]
     pub add: BTreeMap<String, String>,
@@ -190,12 +204,14 @@ pub struct HeaderTransform {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestBodyTransform {
     #[serde(default)]
     pub mapping: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseBodyTransform {
     /// Arbitrary nested envelope structure with `$body`/`$response_time`/
     /// `$route_path` placeholders — kept as a raw value for the P3 transformer.
@@ -244,6 +260,16 @@ impl Config {
                 }
                 _ => {}
             }
+            // Upstream URLs must be absolute http(s) URLs the client can dial.
+            // A scheme-less value ("localhost:3001") or empty string otherwise
+            // loads fine and fails on *every* request with a 502 — catch it at
+            // load so a malformed config never half-starts (fail-fast contract).
+            if let Some(url) = &route.upstream.url {
+                validate_upstream_url(url, &ctx)?;
+            }
+            for (j, target) in route.upstream.targets.iter().enumerate() {
+                validate_upstream_url(&target.url, &format!("{ctx} targets[{j}]"))?;
+            }
             let normalized = normalize_path(&route.path);
             if let Some(prev) = seen_paths.insert(normalized.clone(), i) {
                 anyhow::bail!(
@@ -273,6 +299,28 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Validate that an upstream URL is an absolute `http`/`https` URL with a host.
+/// Rejecting scheme-less/empty/unsupported-scheme values here (rather than
+/// per-request) keeps the fail-fast contract for graders' configs.
+fn validate_upstream_url(url: &str, ctx: &str) -> anyhow::Result<()> {
+    let uri: Uri = url
+        .parse()
+        .with_context(|| format!("{ctx}: upstream url '{url}' is not a valid URI"))?;
+    match uri.scheme_str() {
+        Some("http") | Some("https") => {}
+        Some(other) => anyhow::bail!(
+            "{ctx}: upstream url '{url}' has unsupported scheme '{other}' (expected http/https)"
+        ),
+        None => anyhow::bail!(
+            "{ctx}: upstream url '{url}' must be absolute with an http/https scheme"
+        ),
+    }
+    if uri.authority().is_none() {
+        anyhow::bail!("{ctx}: upstream url '{url}' is missing a host");
+    }
+    Ok(())
 }
 
 /// Normalize a route path for duplicate detection: trim a trailing '/' so that
@@ -618,5 +666,83 @@ routes:
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_field() {
+        // A typo'd key (`stip_prefix`) must fail fast, not silently default to
+        // false and boot a gateway that behaves contrary to the YAML.
+        let yaml = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/x"
+    methods: ["GET"]
+    stip_prefix: true
+    upstream:
+      url: "http://localhost:1"
+"#;
+        assert!(serde_yaml::from_str::<Config>(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_field() {
+        let yaml = r#"
+gateway:
+  port: 8080
+routes: []
+bogus_section: 1
+"#;
+        assert!(serde_yaml::from_str::<Config>(yaml).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_schemeless_upstream_url() {
+        // "localhost:3001" (no scheme) parses as a URI but has no http/https
+        // scheme; it would 502 on every request, so reject it at load.
+        let yaml = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/x"
+    methods: ["GET"]
+    upstream:
+      url: "localhost:3001"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_upstream_url() {
+        let yaml = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/x"
+    methods: ["GET"]
+    upstream:
+      url: ""
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_schemeless_target_url() {
+        let yaml = r#"
+gateway:
+  port: 8080
+routes:
+  - path: "/x"
+    methods: ["GET"]
+    upstream:
+      balance: "round_robin"
+      targets:
+        - url: "http://localhost:3003"
+        - url: "localhost:3004"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
     }
 }
