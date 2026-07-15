@@ -1,0 +1,7 @@
+- software is "soft"ware because it should be easy to change - good architecture anticipates future changes without unnecessary bloat, the way to do this is separation of concerns and modularity where the core business logic lives. Business rules should be almost treated like config, changes there should be easy and frequent.  Organize code in directories that make sense.
+- observability matters, log anything and everything that is useful for debugging, metrics, etc.  OTEL is the way to go here because it let's us swap third-party systems in and out at will
+- code is read more by agents than by humans, but generally both require the same properties - concise, sensible abstractions, why comments over what comments
+- think like the user/client, make the choices that are most helpful and reasonable for them, even when this requires extra work
+- iteration trumps nailing everything up front, but critical planning up front still saves time in the long run
+- coding agents thrive off functional feedback, Rust's strict compiler provides a lot of signal that left-shifts mistakes and thus categorically eliminates many errors, which is well worth the extra compile time penalty because agents are assumed to work autonomously - the bottleneck is human activity, which should be treated as a scarce resource.  In other words, I would rather have an agent work for 2 hours and come back with working software, than 30 minutes and come back with things a human needs to correct.
+
