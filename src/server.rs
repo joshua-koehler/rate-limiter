@@ -4,12 +4,18 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
+
+/// Cap the time a client may take to send its request headers, so a slow-loris
+/// connection that dribbles (or never finishes) the header block can't pin a
+/// connection task. The request-body read is bounded separately in `upstream`.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::pipeline;
 use crate::state::AppState;
@@ -36,7 +42,13 @@ pub async fn run(state: AppState) -> Result<()> {
                         let state = state.clone();
                         async move { Ok::<_, Infallible>(pipeline::handle(state, peer, req).await) }
                     });
-                    if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                    if let Err(err) = http1::Builder::new()
+                        // `header_read_timeout` needs a hyper timer wired in.
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(HEADER_READ_TIMEOUT)
+                        .serve_connection(io, service)
+                        .await
+                    {
                         eprintln!("connection from {peer} ended with error: {err}");
                     }
                 });

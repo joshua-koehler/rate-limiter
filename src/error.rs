@@ -61,6 +61,10 @@ pub enum GatewayError {
     /// exceeds the maximum the gateway will buffer → 413.
     #[error("request body too large")]
     PayloadTooLarge,
+    /// Cross-cutting DoS guard: the client did not finish sending its request
+    /// body within the read-timeout window (slow-loris). Client-side fault → 408.
+    #[error("request body read timed out")]
+    RequestTimeout,
 }
 
 impl GatewayError {
@@ -82,6 +86,7 @@ impl GatewayError {
             GatewayError::CircuitOpen { .. } => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::AllTargetsUnhealthy => StatusCode::SERVICE_UNAVAILABLE,
             GatewayError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            GatewayError::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
         }
     }
 
@@ -99,6 +104,7 @@ impl GatewayError {
             GatewayError::CircuitOpen { .. } => "service_unavailable",
             GatewayError::AllTargetsUnhealthy => "service_unavailable",
             GatewayError::PayloadTooLarge => "payload_too_large",
+            GatewayError::RequestTimeout => "request_timeout",
         }
     }
 

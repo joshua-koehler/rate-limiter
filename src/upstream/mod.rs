@@ -134,6 +134,9 @@ pub async fn proxy(ctx: RequestCtx) -> Result<Response<BoxBody>, GatewayError> {
         .map(|t| Instant::now() + t.saturating_mul(total_attempts) + total_backoff);
 
     let order = route_upstream.preference_order();
+    // Live-traffic failure threshold for passive ejection (Some only when the
+    // route has a `health_check` to probe a target back in) — see target.rs.
+    let passive_threshold = route_upstream.passive_health_threshold();
 
     // Walk the preference order across attempts. `cursor` advances past each
     // target we try so a retry fails over to the *next* eligible target.
@@ -184,12 +187,14 @@ pub async fn proxy(ctx: RequestCtx) -> Result<Response<BoxBody>, GatewayError> {
 
         match outcome {
             AttemptOutcome::Response(resp) => {
-                // Breaker: a 5xx is a failure (once per target/request); anything
-                // else means the target is alive → success.
+                // Breaker + passive health: a 5xx is a failure (once per
+                // target/request); anything else means the target is alive → both
+                // its breaker and its passive-health streak reset.
                 if resp.status().is_server_error() {
-                    note_failure(&mut failed_targets, pool_idx, &target, now);
+                    note_failure(&mut failed_targets, pool_idx, &target, now, passive_threshold);
                 } else {
                     target.breaker.record_success(now);
+                    target.health.record_live_success();
                 }
                 // Retry only on configured statuses; otherwise relay as-is.
                 let retryable = retry.map_or(false, |r| r.on.contains(&resp.status().as_u16()));
@@ -201,12 +206,12 @@ pub async fn proxy(ctx: RequestCtx) -> Result<Response<BoxBody>, GatewayError> {
                 }
             }
             AttemptOutcome::Timeout => {
-                note_failure(&mut failed_targets, pool_idx, &target, now);
+                note_failure(&mut failed_targets, pool_idx, &target, now, passive_threshold);
                 last_response = None;
                 last_kind = LastKind::Timeout;
             }
             AttemptOutcome::Transport(e) => {
-                note_failure(&mut failed_targets, pool_idx, &target, now);
+                note_failure(&mut failed_targets, pool_idx, &target, now, passive_threshold);
                 last_response = None;
                 last_kind = LastKind::Transport(e);
             }
@@ -258,11 +263,23 @@ enum AttemptOutcome {
     Transport(String),
 }
 
-/// Record a failure against `target`'s breaker at most **once per request** (the
-/// per-request-not-per-attempt reconciliation — see module docs).
-fn note_failure(failed: &mut Vec<usize>, pool_idx: usize, target: &TargetRuntime, now: Instant) {
+/// Record a failure against `target` at most **once per request** (the
+/// per-request-not-per-attempt reconciliation — see module docs). Feeds both the
+/// circuit breaker and, when `passive_threshold` is set (route has a
+/// `health_check`), the passive-health streak, so a target that dies mid-interval
+/// is ejected before its next scheduled probe even without a breaker configured.
+fn note_failure(
+    failed: &mut Vec<usize>,
+    pool_idx: usize,
+    target: &TargetRuntime,
+    now: Instant,
+    passive_threshold: Option<u32>,
+) {
     if !failed.contains(&pool_idx) {
         target.breaker.record_failure(now);
+        if let Some(threshold) = passive_threshold {
+            target.health.record_live_failure(threshold);
+        }
         failed.push(pool_idx);
     }
 }
@@ -328,10 +345,25 @@ async fn attempt_call(
     }
 }
 
+/// Maximum wall-clock time allowed to read the *entire* request body. Bounds the
+/// slow-loris vector where a client trickles a body (or never finishes one) to
+/// pin a gateway task indefinitely — a size cap alone doesn't stop a slow tiny
+/// body. On elapse the request is failed with 408, not buffered further.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Buffer the request body into `Bytes`, enforcing [`MAX_BODY_BYTES`] as we go so
-/// an oversize body is rejected (413) *without* first reading it all into memory.
+/// an oversize body is rejected (413) *without* first reading it all into memory,
+/// and bounding the total read by [`BODY_READ_TIMEOUT`] (slow-loris → 408).
 async fn buffer_body(body: Incoming) -> Result<Bytes, GatewayError> {
-    let mut body = body;
+    match tokio::time::timeout(BODY_READ_TIMEOUT, read_body_capped(body)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(GatewayError::RequestTimeout),
+    }
+}
+
+/// Read the body frame-by-frame, rejecting once the accumulated size passes
+/// [`MAX_BODY_BYTES`]. Split out so the whole read can be wrapped in one timeout.
+async fn read_body_capped(mut body: Incoming) -> Result<Bytes, GatewayError> {
     let mut collected: Vec<u8> = Vec::new();
     while let Some(next) = body.frame().await {
         let frame =

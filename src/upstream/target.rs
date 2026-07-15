@@ -100,6 +100,13 @@ impl RouteUpstream {
         self.balancer.preference_order(self.targets.len())
     }
 
+    /// The live-traffic failure threshold for passive ejection, present only when
+    /// the route configures a `health_check` (so there is a prober to recover the
+    /// target). `None` → no passive ejection (nothing would probe it back in).
+    pub fn passive_health_threshold(&self) -> Option<u32> {
+        self.health_check.as_ref().map(|h| h.unhealthy_threshold)
+    }
+
     /// Scan `order` for the first eligible target, starting at position `start`
     /// and wrapping. Health-unhealthy targets are skipped silently; breaker-Open
     /// targets are skipped but recorded so the caller can map "all Open" to a

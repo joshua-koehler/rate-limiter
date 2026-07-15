@@ -428,6 +428,57 @@ routes:
     assert_eq!(a_hits, 10, "remaining traffic fails over to the healthy target");
 }
 
+#[tokio::test]
+async fn passive_ejection_works_with_health_check_but_no_breaker() {
+    // The spec's `/api/products` shape: a load-balanced route with `health_check`
+    // and NO `circuit_breaker`. B fails live traffic while its `/healthz` still
+    // answers 200 (so active probing alone would never eject it). A long probe
+    // interval keeps the prober from firing within the test, isolating the
+    // *passive* path: B's live failures must eject it after `unhealthy_threshold`.
+    let a = spawn_mock("A", Ctl::new()).await;
+    let b = spawn_mock("B", Ctl::with_status(503)).await; // healthz stays 200
+    let port = free_port();
+    let cfg = format!(
+        r#"
+gateway:
+  port: {port}
+routes:
+  - path: "/pe2"
+    methods: ["GET"]
+    upstream:
+      balance: "round_robin"
+      targets:
+        - url: "{a}"
+        - url: "{b}"
+      health_check:
+        path: "/healthz"
+        interval: "60s"
+        unhealthy_threshold: 2
+"#
+    );
+    let gw = spawn_gateway(&cfg, port).await;
+    let cl = client();
+
+    let mut fails = 0;
+    let mut a_hits = 0;
+    for _ in 0..12 {
+        let resp = get(&cl, &gw.url("/pe2")).await;
+        match resp.header("x-server").as_deref() {
+            Some("A") => {
+                assert_eq!(resp.status, 200);
+                a_hits += 1;
+            }
+            Some("B") => {
+                assert_eq!(resp.status, 503);
+                fails += 1;
+            }
+            other => panic!("unexpected server {other:?}"),
+        }
+    }
+    assert_eq!(fails, 2, "B passively ejected after `unhealthy_threshold` live failures");
+    assert_eq!(a_hits, 10, "traffic fails over to A with no breaker configured");
+}
+
 // ── Health checks ────────────────────────────────────────────────────────────
 
 #[tokio::test]
