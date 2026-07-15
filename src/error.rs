@@ -37,11 +37,16 @@ pub enum GatewayError {
     MethodNotAllowed { allow: String },
     #[error("bad gateway: {0}")]
     BadGateway(String),
+    /// P1 rate limiting: over the configured limit. `retry_after` is whole
+    /// seconds until capacity, surfaced in the `Retry-After` header.
+    #[error("rate limit exceeded (retry after {retry_after}s)")]
+    RateLimited { retry_after: u64 },
+    /// P1 timeouts: the upstream did not respond within the effective timeout.
+    #[error("upstream timed out")]
+    GatewayTimeout,
     // Planned (later tiers), each already fits the into_response() shape:
     //   Unauthorized                       -> 401  (P2 api_key auth)
-    //   RateLimited { retry_after: u64 }    -> 429  (P1 rate limiting)
     //   CircuitOpen { retry_after: u64 }    -> 503 envelope (P2)
-    //   GatewayTimeout                      -> 504  (P1 timeouts)
     //   AllTargetsUnhealthy                 -> 503  (P2 health checks)
 }
 
@@ -58,6 +63,8 @@ impl GatewayError {
             GatewayError::NotFound => StatusCode::NOT_FOUND,
             GatewayError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             GatewayError::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            GatewayError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            GatewayError::GatewayTimeout => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 
@@ -67,6 +74,8 @@ impl GatewayError {
             GatewayError::NotFound => "not_found",
             GatewayError::MethodNotAllowed { .. } => "method_not_allowed",
             GatewayError::BadGateway(_) => "bad_gateway",
+            GatewayError::RateLimited { .. } => "rate_limited",
+            GatewayError::GatewayTimeout => "gateway_timeout",
         }
     }
 
@@ -81,6 +90,9 @@ impl GatewayError {
             .header(header::CONTENT_TYPE, "application/json");
         if let GatewayError::MethodNotAllowed { allow } = &self {
             builder = builder.header(header::ALLOW, allow.clone());
+        }
+        if let GatewayError::RateLimited { retry_after } = &self {
+            builder = builder.header(header::RETRY_AFTER, retry_after.to_string());
         }
         builder
             .body(full(body))
