@@ -169,7 +169,7 @@ impl UpstreamRegistry {
                 let balancer = match up.balance {
                     Some(Balance::RoundRobin) => Balancer::round_robin(),
                     Some(Balance::WeightedRoundRobin) => {
-                        let weights: Vec<u32> = up.targets.iter().map(|t| t.weight).collect();
+                        let weights: Vec<u32> = targets.iter().map(|t| t.weight).collect();
                         Balancer::weighted(&weights)
                     }
                     None => {
