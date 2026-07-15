@@ -20,7 +20,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -116,12 +116,12 @@ impl RouteLimiter {
     fn check(&self, now: Instant, ip: IpAddr) -> Result<(), u64> {
         match &self.store {
             Store::Global { bucket } => {
-                let mut entry = bucket.lock().unwrap();
+                let mut entry = bucket.lock().unwrap_or_else(PoisonError::into_inner);
                 self.admit(&mut entry, now)
             }
             Store::PerIp { shards } => {
                 let idx = shard_index(ip, shards.len());
-                let mut map = shards[idx].lock().unwrap();
+                let mut map = shards[idx].lock().unwrap_or_else(PoisonError::into_inner);
                 let entry = map.entry(ip).or_insert_with(|| Entry::new(now));
                 self.admit(entry, now)
             }
@@ -186,13 +186,26 @@ impl RouteLimiter {
         let weighted = entry.prev_count as f64 * (1.0 - fraction) + entry.count as f64;
 
         if weighted + 1.0 > self.requests as f64 {
-            // retry_after approximation: seconds until the current sub-window
-            // rolls over, at which point the previous window's contribution is
-            // dropped and capacity is very likely to return. A simple, slightly
-            // conservative estimate — we deliberately don't solve the exact
-            // weighted-decay equation for `weighted <= requests - 1`.
-            let reset = entry.window_start + self.window;
-            let retry = ceil_secs(reset.saturating_duration_since(now));
+            // Time until capacity returns. Within the current sub-window `count`
+            // and `prev_count` are fixed; only the previous window's weight
+            // decays as `fraction` grows toward 1. We are admitted again once
+            //     prev * (1 - frac) + count + 1 <= requests
+            // i.e. once prev's weight drops to `headroom = requests - 1 - count`.
+            let headroom = self.requests as f64 - 1.0 - entry.count as f64;
+            let retry = if headroom < 0.0 || entry.prev_count == 0 {
+                // The current sub-window alone already meets/exceeds the limit:
+                // no amount of prev-decay helps, so capacity can only return when
+                // this sub-window rolls over. A correct lower bound (the window
+                // that rolls in may itself be full, needing one more attempt).
+                let reset = entry.window_start + self.window;
+                ceil_secs(reset.saturating_duration_since(now))
+            } else {
+                // Solve prev * (1 - frac_target) = headroom for the fraction at
+                // which we'd admit, then the remaining wall-clock to reach it.
+                let frac_target = 1.0 - headroom / entry.prev_count as f64;
+                let dt = (frac_target - fraction) * self.window.as_secs_f64();
+                dt.ceil().max(0.0) as u64
+            };
             return Err(retry.max(1));
         }
         entry.count += 1;
@@ -209,7 +222,7 @@ impl RouteLimiter {
                 // Lock one shard at a time and briefly: request handling for
                 // other shards is unaffected, and this shard is held only for
                 // the retain scan.
-                let mut map = shard.lock().unwrap();
+                let mut map = shard.lock().unwrap_or_else(PoisonError::into_inner);
                 map.retain(|_ip, entry| !self.is_idle(entry, now));
             }
         }
@@ -228,7 +241,7 @@ impl RouteLimiter {
     #[cfg(test)]
     fn entry_count(&self) -> usize {
         match &self.store {
-            Store::PerIp { shards } => shards.iter().map(|s| s.lock().unwrap().len()).sum(),
+            Store::PerIp { shards } => shards.iter().map(|s| s.lock().unwrap_or_else(PoisonError::into_inner).len()).sum(),
             Store::Global { .. } => 1,
         }
     }
@@ -436,6 +449,43 @@ mod tests {
         // t0 + 19s (9s into sub-window 2): weighted = 4*0.1 = 0.4 -> admit.
         let t2 = t0 + Duration::from_secs(19);
         assert!(limiter.check(t2, a).is_ok(), "capacity returns as weight decays");
+    }
+
+    #[test]
+    fn fixed_window_retry_after_is_within_the_window() {
+        let limiter = RouteLimiter::new(&rl(1, 30, Strategy::FixedWindow, Per::Ip));
+        let a = ip("10.0.0.1");
+        let t0 = Instant::now();
+        assert!(limiter.check(t0, a).is_ok());
+        // Immediately over -> Retry-After is the remaining window, never outside
+        // [1, window].
+        let retry = limiter.check(t0, a).unwrap_err();
+        assert!((1..=30).contains(&retry), "retry_after {retry} out of [1,30]");
+        assert_eq!(retry, 30, "a fresh full window -> ~window seconds");
+    }
+
+    #[test]
+    fn sliding_window_retry_after_points_at_real_capacity() {
+        // 4 req / 10s, window 1 saturated. A rejected request's Retry-After must
+        // sit in [1, window] AND actually be sufficient: re-checking after that
+        // many seconds admits (the old "until sub-window rolls" estimate did not
+        // guarantee this).
+        let limiter = RouteLimiter::new(&rl(4, 10, Strategy::SlidingWindow, Per::Ip));
+        let a = ip("10.0.0.1");
+        let t0 = Instant::now();
+        for _ in 0..4 {
+            assert!(limiter.check(t0, a).is_ok());
+        }
+        // 0.5s into window 2: prev=4 dominates -> rejected.
+        let t1 = t0 + Duration::from_millis(10_500);
+        let retry = limiter.check(t1, a).unwrap_err();
+        assert!((1..=10).contains(&retry), "retry_after {retry} out of [1,10]");
+        // Waiting the advertised time admits (small epsilon for the boundary).
+        let t2 = t1 + Duration::from_secs(retry) + Duration::from_millis(50);
+        assert!(
+            limiter.check(t2, a).is_ok(),
+            "capacity is actually available at the advertised Retry-After"
+        );
     }
 
     #[test]
