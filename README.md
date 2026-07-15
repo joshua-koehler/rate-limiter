@@ -36,7 +36,7 @@ cargo test
 
 ## Architecture
 
-The request pipeline is an ordered list of composable **stages**. Each stage implements a common `Stage` trait, and the pipeline is assembled **per route** from the parsed config, then iterated in order. Fast rejections (404 / 405 / 401 / 429) short-circuit before any upstream work.
+The request pipeline is an ordered list of composable **stages**. Each stage implements a common `Stage` trait, and the pipeline is assembled **per route** from the parsed config, then iterated in order. Fast rejections (404 / 405 / 401 / 429) short-circuit before any upstream work. The response side is symmetric: a `ResponseStage` chain (also assembled per route) transforms genuine upstream responses on the way back — so the same "add a stage" extensibility applies in both directions.
 
 This is the core extensibility decision: **adding a config feature means adding a config struct, writing one stage, and registering it — no change to the core loop.**
 
@@ -45,7 +45,7 @@ This is the core extensibility decision: **adding a config feature means adding 
 | Module | Responsibility |
 | --- | --- |
 | `config` | Parse YAML into typed structs; validate durations, enums, and cross-field constraints at load. |
-| `pipeline/` | The `Stage` trait plus one file per stage. |
+| `pipeline/` | The request `Stage` trait and the response `ResponseStage` trait, plus one file per stage (`method`, `auth`, `rate_limit`, `request_transform`, `response_transform`) and the shared `transform` helpers (timestamps, value resolution, JSON dot-paths). |
 | `upstream/` | The terminal upstream call + the P2 resilience layer: load balancing, per-target circuit breakers, active/passive health, retry+backoff, request-body buffering, and proxy hygiene (hop-by-hop stripping, `Host` rewrite, `Content-Length` recompute). |
 | `router` | Route matching — longest-prefix, on path-segment boundaries. |
 | `server` | `hyper` wiring, request handling, and structured access logging. |
@@ -83,7 +83,7 @@ Organized by priority tier (see [reqs.md](./reqs.md) for the full requirements).
 - [x] Health checks — active background probing (eject after `unhealthy_threshold`, recover on first success) + passive breaker ejection between probes; all targets down → `503`
 - [x] Request body cap — retries buffer the request body (bounded, 2 MiB); oversize → `413`
 
-### P3 — Transformation & advanced (planned)
+### P3 — Transformation & advanced
 
-- [ ] Request transforms — header add/remove, JSON body mapping, dynamic values
-- [ ] Response transforms — header add/remove, body envelope
+- [x] Request transforms — header add/remove (`$request_time` / `$literal:` values), JSON body mapping (dot-path `dest <- source`, non-JSON passthrough); `$request_time` computed once so header and body agree
+- [x] Response transforms — header add/remove, body envelope (`$body` / `$response_time` / `$route_path`); non-JSON/empty upstream body embedded as a JSON string; applied only to real upstream responses (never to gateway-generated errors)
