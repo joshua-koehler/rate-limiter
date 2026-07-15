@@ -120,18 +120,30 @@ impl Breaker {
         }
     }
 
-    /// Record a successful outcome against this target: the target is alive, so
-    /// the breaker fully resets to a clean Closed window (this both closes a
-    /// half-open probe and clears any partial failure count).
+    /// Record a successful outcome against this target.
+    ///
+    /// A success in **Half-Open** is the trial passing → close the breaker with a
+    /// clean window. A success in **Closed** does **not** clear the rolling
+    /// failure count: the spec counts failures *within `window`* toward the
+    /// threshold, so an upstream that is only *partially* failing (e.g.
+    /// 503,200,503,200…) must still accrue toward tripping — zeroing on every 2xx
+    /// would let a steadily-degrading upstream never trip, defeating the exact
+    /// case the breaker exists for. Failures instead age out by time (see
+    /// [`record_failure`]'s window check). `Open` never sees a success (we don't
+    /// call upstream while Open), but is handled defensively.
     pub fn record_success(&self, now: Instant) {
         if self.config.is_none() {
             return;
         }
         let mut state = self.state.lock().unwrap();
-        *state = State::Closed {
-            failures: 0,
-            window_start: now,
-        };
+        if matches!(&*state, State::HalfOpen | State::Open { .. }) {
+            *state = State::Closed {
+                failures: 0,
+                window_start: now,
+            };
+        }
+        // Closed: leave the rolling window untouched — a success is not evidence
+        // that earlier in-window failures didn't happen.
     }
 
     /// Record a failed outcome (5xx / timeout / connection error) against this
@@ -263,6 +275,26 @@ mod tests {
             Allow::Reject { retry_after } => assert_eq!(retry_after, 25, "cooldown restarted"),
             other => panic!("expected Reject, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn interleaved_successes_do_not_reset_the_window_count() {
+        // The degrading-upstream case: 503,200,503,200,503 within the window must
+        // still trip a threshold-3 breaker — a 2xx between failures is not proof
+        // the earlier in-window failures didn't happen. (Regression guard: a prior
+        // impl zeroed the count on every success and never tripped here.)
+        let b = Breaker::new(Some(&cb(3, 60, 30)));
+        let t0 = Instant::now();
+        b.record_failure(t0); // 1
+        b.record_success(t0); // interleaved 2xx — must NOT reset the count
+        b.record_failure(t0); // 2
+        b.record_success(t0);
+        assert_eq!(b.allow(t0), Allow::Permit, "2 < threshold, still closed");
+        b.record_failure(t0); // 3 → trips despite the interleaved successes
+        assert!(
+            matches!(b.allow(t0), Allow::Reject { .. }),
+            "3 in-window failures trip even with successes between them"
+        );
     }
 
     #[test]
