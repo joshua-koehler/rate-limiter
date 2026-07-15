@@ -1,0 +1,20 @@
+[package]
+name = "gatewaykit"
+version = "0.1.0"
+edition = "2021"
+description = "GatewayKit — a lightweight, config-driven API gateway built on hyper"
+
+[[bin]]
+name = "gatewaykit"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["server", "http1", "client"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "server", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+anyhow = "1"
