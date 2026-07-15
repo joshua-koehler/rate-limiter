@@ -14,17 +14,34 @@ cargo build --release
 
 ## Run
 
-GatewayKit reads its config from a YAML file. The path is supplied via a CLI flag **or** an environment variable — **the CLI flag wins** when both are set:
+GatewayKit reads its config from a YAML file. A ready-to-run, fully-commented example ships as [`gateway.example.yaml`](./gateway.example.yaml) — it exercises every feature across all tiers. The config path is supplied via a CLI flag **or** an environment variable — **the CLI flag wins** when both are set:
 
 ```sh
 # CLI flag
-cargo run -- --config gateway.yaml
+cargo run -- --config gateway.example.yaml
 
 # environment variable
-CONFIG=gateway.yaml cargo run
+CONFIG=gateway.example.yaml cargo run
 ```
 
-The gateway binds the port from `gateway.port` in the config. A **malformed or invalid config fails fast**: it prints a clear error and exits non-zero rather than starting half-configured. Validation covers durations, enums, and cross-field constraints (see [DECISIONS.md](./DECISIONS.md)).
+The gateway binds the port from `gateway.port` in the config (`8080` in the example). A **malformed or invalid config fails fast**: it prints a clear error and exits non-zero rather than starting half-configured. Validation covers durations, enums, and cross-field constraints (see [DECISIONS.md](./DECISIONS.md)).
+
+### Try it end to end
+
+```sh
+# 1. start the gateway
+cargo run -- --config gateway.example.yaml
+
+# 2. in another shell — the health endpoint is always up, independent of routing
+curl -s localhost:8080/health
+# {"status":"healthy","uptime_seconds":3}
+
+# 3. proxy a request to an upstream (point the config's upstream URLs at any
+#    HTTP service, or run one quickly — e.g. `python3 -m http.server 3001`)
+curl -i localhost:8080/api/users
+```
+
+Prefer no external services? `cargo test` spins up an in-process mock upstream and drives the real binary — see below.
 
 ## Test
 

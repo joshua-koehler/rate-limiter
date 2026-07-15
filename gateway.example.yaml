@@ -1,0 +1,109 @@
+# gateway.example.yaml — a runnable GatewayKit config.
+#
+#   cargo run -- --config gateway.example.yaml
+#
+# The gateway binds `gateway.port` below and proxies each route to its
+# upstream. Point the upstream URLs at any HTTP services you have (or run the
+# tiny mock the test suite uses). Every block here parses and validates; the
+# comments show the full feature surface across all tiers.
+
+gateway:
+  port: 8080
+
+  # Default upstream timeout; overridable per route.
+  global_timeout: "30s"
+
+  # Default rate limit for every route unless the route overrides it.
+  global_rate_limit:
+    requests: 100
+    window: "60s"
+    strategy: "fixed_window"   # "fixed_window" | "sliding_window"
+    per: "ip"                  # "ip" | "global"
+
+routes:
+  # --- P0/P1: simple prefix proxy with a per-route rate limit --------------
+  - path: "/api/users"
+    methods: ["GET", "POST"]
+    strip_prefix: false
+    upstream:
+      url: "http://localhost:3001"
+    rate_limit:
+      requests: 30
+      window: "60s"
+      strategy: "sliding_window"
+      per: "ip"
+
+  # --- P1/P2: per-route timeout + retry with backoff ----------------------
+  - path: "/api/orders"
+    methods: ["GET", "POST", "PUT"]
+    strip_prefix: false
+    upstream:
+      url: "http://localhost:3002"
+    timeout: "5s"
+    retry:
+      attempts: 3
+      backoff: "exponential"   # "fixed" | "exponential"
+      initial_delay: "1s"
+      on: [502, 503, 504]      # statuses (plus transport errors/timeouts) that retry
+
+  # --- P2: load balancing across targets + active health checks -----------
+  - path: "/api/products"
+    methods: ["GET"]
+    strip_prefix: true          # /api/products/123 -> /123 upstream
+    upstream:
+      targets:
+        - url: "http://localhost:3003"
+          weight: 3
+        - url: "http://localhost:3004"
+          weight: 1
+      balance: "weighted_round_robin"   # "round_robin" | "weighted_round_robin"
+      health_check:
+        path: "/healthz"
+        interval: "30s"
+        unhealthy_threshold: 3
+    timeout: "10s"
+
+  # --- P3: request + response transforms ----------------------------------
+  - path: "/api/legacy"
+    methods: ["GET", "POST"]
+    strip_prefix: true
+    upstream:
+      url: "http://localhost:3005"
+    request_transform:
+      headers:
+        add:
+          X-Gateway: "gatewaykit"
+          X-Request-Start: "$request_time"   # dynamic: request timestamp
+        remove: ["X-Debug", "X-Internal"]
+      body:
+        mapping:                              # dest-path <- source-path (dot notation)
+          user.id: "userId"
+          user.name: "userName"
+          meta.source: "$literal:gateway"     # inject a literal
+          meta.timestamp: "$request_time"
+    response_transform:
+      headers:
+        add:
+          X-Served-By: "gatewaykit"
+        remove: ["Server", "X-Powered-By"]
+      body:
+        envelope:
+          data: "$body"                       # original upstream body
+          gateway_metadata:
+            served_at: "$response_time"
+            route: "$route_path"
+
+  # --- P2: authentication + circuit breaker -------------------------------
+  - path: "/api/internal"
+    methods: ["GET", "POST"]
+    strip_prefix: false
+    upstream:
+      url: "http://localhost:3006"
+    auth:
+      type: "api_key"
+      header: "X-API-Key"
+      keys: ["sk_live_abc123", "sk_live_def456"]
+    circuit_breaker:
+      threshold: 5              # trip after 5 failures...
+      window: "60s"            # ...within this window
+      cooldown: "30s"         # wait this long before probing upstream again
