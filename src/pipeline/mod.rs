@@ -18,6 +18,7 @@
 //! Fast-reject stages (404 pre-chain, 405/401/429/503…) short-circuit *before*
 //! any upstream work by returning [`Flow::ShortCircuit`].
 
+mod auth;
 mod method;
 
 use std::net::SocketAddr;
@@ -34,6 +35,7 @@ use crate::rate_limit::{effective_rate_limit, RateLimitStage};
 use crate::state::AppState;
 use crate::{health, upstream};
 
+use auth::AuthStage;
 use method::MethodStage;
 
 /// Outcome of a stage: either let the request proceed, or terminate it now with
@@ -150,16 +152,23 @@ pub fn assemble(config: &Config) -> Vec<Vec<Arc<dyn Stage>>> {
             // P0 — method filtering (405 + Allow).
             stages.push(Arc::new(MethodStage::new(&route.methods)));
 
+            // P2 — api_key auth (401). Pushed only for routes that declare
+            // `auth`, so open routes pay nothing. Runs after method but BEFORE
+            // rate limiting: the key compare is guarded first, and rate-limit
+            // bucketing needs no client identity (DECISIONS.md).
+            if let Some(a) = &route.auth {
+                stages.push(Arc::new(AuthStage::new(a)));
+            }
+
             // P1 — rate limiting (429 + Retry-After). Pushed only when the route
             // has an effective limit, so unlimited routes carry no stage and pay
-            // nothing. Runs after method (auth will slot in ahead of it in P2).
+            // nothing. Runs after method and auth.
             if effective_rate_limit(route, config).is_some() {
                 stages.push(Arc::new(RateLimitStage));
             }
 
             // SEAM — later tiers register their stages here, in pipeline order,
             // gated on the route's config so absent blocks add no overhead:
-            //   if let Some(a) = &route.auth        { stages.push(Arc::new(AuthStage::new(a))) }         // P2
             //   if let Some(rt) = &route.request_transform { stages.push(Arc::new(RequestTransform)) }   // P3
             // (circuit-breaker gate + target selection wrap the terminal call.)
 
