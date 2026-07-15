@@ -103,11 +103,22 @@ async fn second_config_with_different_routes_and_all_optional_blocks_works() {
     let bad_method = send(&client, Method::DELETE, &gw.url("/v2/widgets"), &[], "").await;
     assert_eq!(bad_method.status, 405);
 
-    // A route carrying auth/rate_limit/CB/transform blocks proxies in P0
-    // (those policies are enforced by later tiers; parsing them is P0.5).
-    let secure = send(&client, Method::POST, &gw.url("/secure/data"), &[], "hi").await;
+    // A route carrying auth/rate_limit/CB blocks: as of P2 the api_key auth is
+    // enforced, so a request with a valid key proxies (200 + echoed body) while
+    // one without is rejected (401). This doubles as a schema-general check that
+    // the auth block wires up on a brand-new config with no code changes.
+    let secure = send(
+        &client,
+        Method::POST,
+        &gw.url("/secure/data"),
+        &[("X-API-Key", "sk_test_1")],
+        "hi",
+    )
+    .await;
     assert_eq!(secure.status, 200);
     assert_eq!(secure.body_str(), "hi");
+    let unauthed = send(&client, Method::POST, &gw.url("/secure/data"), &[], "hi").await;
+    assert_eq!(unauthed.status, 401);
 
     // /health remains available regardless of the new config.
     assert_eq!(get(&client, &gw.url("/health")).await.status, 200);
