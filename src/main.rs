@@ -1,24 +1,29 @@
 //! GatewayKit — a lightweight, config-driven API gateway.
 //!
-//! (Scaffolding step: this entrypoint currently only loads and validates the
-//! config, failing fast on any error. The HTTP server is wired up next.)
+//! Entry point: resolve the config path (`--config <path>` or `CONFIG` env),
+//! load + validate the config (failing fast, non-zero exit, on any error),
+//! build shared state, and run the server.
 
 mod config;
+mod error;
+mod health;
+mod pipeline;
+mod proxy;
+mod router;
+mod server;
+mod state;
 
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let config_path = resolve_config_path()?;
-    let cfg = config::load(&config_path)
+    let config = config::load(&config_path)
         .with_context(|| format!("loading config from '{}'", config_path.display()))?;
-    eprintln!(
-        "GatewayKit config OK: port {}, {} route(s)",
-        cfg.gateway.port,
-        cfg.routes.len()
-    );
-    Ok(())
+    let state = state::AppState::new(config);
+    server::run(state).await
 }
 
 /// Resolve the config path from `--config <path>` (or `--config=<path>`),
