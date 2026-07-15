@@ -20,6 +20,14 @@
 
 mod auth;
 mod method;
+mod request_transform;
+mod response_transform;
+mod transform;
+
+// Re-exported for the upstream module: request *body* mapping runs at the body
+// buffer boundary in `upstream::proxy` (the retry loop already buffers the body),
+// not as a pipeline Stage — see `assemble` and DECISIONS.md.
+pub use request_transform::apply_body_mapping;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -79,6 +87,37 @@ impl RequestCtx {
     }
 }
 
+/// A composable **post-upstream** step: transforms the upstream response before
+/// it returns to the client. The response-phase analogue of [`Stage`]. Registering
+/// a P3 response transform is "add a struct + impl this + push in
+/// [`assemble_response`]" — symmetric with the request phase, so the pipeline
+/// extends the same way in *both* directions with no change to [`handle`].
+#[async_trait]
+pub trait ResponseStage: Send + Sync {
+    async fn apply(&self, ctx: &mut ResponseCtx);
+}
+
+/// Per-response context threaded through the response-transform chain. Stages
+/// mutate `resp` in place (headers, body envelope). Built only for real upstream
+/// responses — gateway-generated errors (404/401/429/503/504…) skip this phase
+/// (DECISIONS.md: envelope/transform applies only to genuine upstream responses).
+/// `state`/`route_index` are the seam's surface for P3 (e.g. `$route_path`,
+/// `response_transform` config); unused until then.
+#[allow(dead_code)]
+pub struct ResponseCtx {
+    pub state: AppState,
+    pub route_index: usize,
+    pub resp: Response<BoxBody>,
+}
+
+impl ResponseCtx {
+    /// Matched route path — the `$route_path` placeholder source for envelopes.
+    #[allow(dead_code)]
+    pub fn route_path(&self) -> &str {
+        &self.state.config.routes[self.route_index].path
+    }
+}
+
 /// Entry point invoked per request by the server's connection service.
 ///
 /// Health and routing run *ahead* of the per-route chain: health can never be
@@ -131,11 +170,38 @@ pub async fn handle(
     // Terminal upstream call (P1/P2 wrap this in timeout + retry + LB/breaker).
     let route_path = ctx.route_path().to_string();
     let resp = match upstream::proxy(ctx).await {
-        Ok(resp) => resp,
+        // Response-transform phase: real upstream responses flow through the
+        // route's response chain before returning. Gateway-generated errors below
+        // deliberately skip it — envelopes/transforms apply only to genuine
+        // upstream responses.
+        Ok(resp) => run_response_stages(&state, route_index, resp).await,
         Err(e) => e.into_response(),
     };
     access_log(&method, &path, &route_path, resp.status(), start);
     resp
+}
+
+/// Run a route's response-phase chain over a real upstream response. A no-op
+/// (and allocation-free) when the route registers no response stages, which is
+/// every route until P3 transforms land.
+async fn run_response_stages(
+    state: &AppState,
+    route_index: usize,
+    resp: Response<BoxBody>,
+) -> Response<BoxBody> {
+    let stages = &state.response_stages[route_index];
+    if stages.is_empty() {
+        return resp;
+    }
+    let mut ctx = ResponseCtx {
+        state: state.clone(),
+        route_index,
+        resp,
+    };
+    for stage in stages {
+        stage.apply(&mut ctx).await;
+    }
+    ctx.resp
 }
 
 /// Assemble each route's stage chain once, at startup, from the parsed config.
@@ -172,6 +238,26 @@ pub fn assemble(config: &Config) -> Vec<Vec<Arc<dyn Stage>>> {
             //   if let Some(rt) = &route.request_transform { stages.push(Arc::new(RequestTransform)) }   // P3
             // (circuit-breaker gate + target selection wrap the terminal call.)
 
+            stages
+        })
+        .collect()
+}
+
+/// Assemble each route's **response-phase** chain (P3 response transforms),
+/// indexed by route index like [`assemble`]. Empty today — the seam is live, so a
+/// response transform registers here exactly as a request stage registers above,
+/// with no change to [`handle`]'s loop. This is what makes the "extend in an
+/// afternoon" claim hold for the response side, not just the request side.
+pub fn assemble_response(config: &Config) -> Vec<Vec<Arc<dyn ResponseStage>>> {
+    config
+        .routes
+        .iter()
+        .map(|_route| {
+            let stages: Vec<Arc<dyn ResponseStage>> = Vec::new();
+            // SEAM — P3 response transforms register here, gated on route config:
+            //   if let Some(rt) = &_route.response_transform {
+            //       stages.push(Arc::new(ResponseTransformStage::new(rt)));
+            //   }
             stages
         })
         .collect()

@@ -10,7 +10,7 @@ use hyper_util::rt::TokioExecutor;
 
 use crate::config::Config;
 use crate::error::BoxBody;
-use crate::pipeline::{self, Stage};
+use crate::pipeline::{self, ResponseStage, Stage};
 use crate::rate_limit::RateLimiterRegistry;
 use crate::router::Router;
 use crate::upstream::UpstreamRegistry;
@@ -32,6 +32,11 @@ pub struct AppState {
     /// per request by the pipeline. `Arc<dyn Stage>` entries are shared, so a
     /// clone of `AppState` shares the same stages.
     pub stages: Arc<Vec<Vec<Arc<dyn Stage>>>>,
+    /// Per-route **response-phase** chains (P3 response transforms), indexed like
+    /// `stages`. Empty until P3, but the seam is wired: `handle` runs these over
+    /// every real upstream response, so the response side extends exactly like
+    /// the request side.
+    pub response_stages: Arc<Vec<Vec<Arc<dyn ResponseStage>>>>,
     /// P1 rate-limit counters, keyed by route index (per: ip → sharded map,
     /// per: global → one bucket). Shared across every connection so limits are
     /// enforced process-wide; the `RateLimitStage` reads it via `ctx.state`.
@@ -50,6 +55,7 @@ impl AppState {
     pub fn new(config: Config) -> Self {
         let router = Router::build(&config);
         let stages = Arc::new(pipeline::assemble(&config));
+        let response_stages = Arc::new(pipeline::assemble_response(&config));
         // Build the registry from `&config` *before* `config` is moved into its
         // Arc below. The registry owns its counters (no borrow of `config`).
         let rate_limiters = Arc::new(RateLimiterRegistry::build(&config));
@@ -71,6 +77,7 @@ impl AppState {
             client,
             start: Instant::now(),
             stages,
+            response_stages,
             rate_limiters,
             upstreams,
         }

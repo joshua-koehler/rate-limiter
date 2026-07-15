@@ -340,13 +340,31 @@ fn backoff_delay(retry: Option<&Retry>, n: u32) -> Option<Duration> {
     Some(delay)
 }
 
+/// Hard backstop applied when a valid config sets no timeout anywhere (all three
+/// knobs are optional in the schema). Without it, a connected-but-hung upstream
+/// would pin a request/task forever — no config is a reason to be unbounded. 30s
+/// mirrors the spec's example `global_timeout`; an explicit config value always
+/// wins over it.
+const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Resolve the per-attempt timeout, first-present-wins: route `timeout` beats
-/// `upstream.timeout` beats the gateway `global_timeout`; `None` = unbounded.
+/// `upstream.timeout` beats the gateway `global_timeout`, and a hard default
+/// backstops the case where the config sets none. Always `Some`, so every attempt
+/// is bounded and the overall retry deadline is always finite.
+///
+/// Scope: this bounds time-to-**response-headers** (when hyper resolves the
+/// request future), not the streamed response body. A well-behaved upstream that
+/// sends headers then trickles the body is not covered here; a body/idle timeout
+/// is future work (noted in DECISIONS.md), kept out of P1/P2 to avoid a second
+/// body-streaming design pass.
 fn effective_timeout(route: &Route, gateway: &Gateway) -> Option<Duration> {
-    route
-        .timeout
-        .or(route.upstream.timeout)
-        .or(gateway.global_timeout)
+    Some(
+        route
+            .timeout
+            .or(route.upstream.timeout)
+            .or(gateway.global_timeout)
+            .unwrap_or(DEFAULT_ATTEMPT_TIMEOUT),
+    )
 }
 
 /// Relay an upstream response: keep status + end-to-end headers + body, drop
