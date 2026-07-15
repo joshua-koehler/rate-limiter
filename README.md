@@ -46,7 +46,7 @@ This is the core extensibility decision: **adding a config feature means adding 
 | --- | --- |
 | `config` | Parse YAML into typed structs; validate durations, enums, and cross-field constraints at load. |
 | `pipeline/` | The `Stage` trait plus one file per stage. |
-| `upstream/` | HTTP client, target selection, and proxy hygiene (hop-by-hop stripping, `Host` rewrite, `Content-Length` recompute). |
+| `upstream/` | The terminal upstream call + the P2 resilience layer: load balancing, per-target circuit breakers, active/passive health, retry+backoff, request-body buffering, and proxy hygiene (hop-by-hop stripping, `Host` rewrite, `Content-Length` recompute). |
 | `router` | Route matching — longest-prefix, on path-segment boundaries. |
 | `server` | `hyper` wiring, request handling, and structured access logging. |
 | `health` | The `/health` endpoint, handled independently of routing. |
@@ -74,13 +74,14 @@ Organized by priority tier (see [reqs.md](./reqs.md) for the full requirements).
 - [x] `strip_prefix` — forward the original or prefix-stripped path (query preserved)
 - [x] Timeouts — global + per-route override; upstream timeout → `504`
 
-### P2 — Resilience & policy (planned)
+### P2 — Resilience & policy (done)
 
-- [ ] Authentication — `api_key` header check; missing/invalid → `401`
-- [ ] Retry with backoff — fixed / exponential, on configured statuses and transport errors
-- [ ] Circuit breaker — per-target; open → `503` envelope
-- [ ] Load balancing — `round_robin` / `weighted_round_robin` across targets
-- [ ] Health checks — active probing with passive ejection
+- [x] Authentication — `api_key` header check; missing/invalid → `401`; constant-time key compare; runs before rate limiting
+- [x] Retry with backoff — fixed / exponential, on configured statuses **and** transport errors/timeouts; per-attempt timeout + overall wall-clock budget; fails over to the next eligible target
+- [x] Circuit breaker — per-target, single-probe half-open; open → `503` `{ "error": "service_unavailable", "retry_after": <s> }`
+- [x] Load balancing — `round_robin` (weight-ignoring) / `weighted_round_robin` (smooth WRR) across `targets`; skips unhealthy / breaker-open targets
+- [x] Health checks — active background probing (eject after `unhealthy_threshold`, recover on first success) + passive breaker ejection between probes; all targets down → `503`
+- [x] Request body cap — retries buffer the request body (bounded, 2 MiB); oversize → `413`
 
 ### P3 — Transformation & advanced (planned)
 
