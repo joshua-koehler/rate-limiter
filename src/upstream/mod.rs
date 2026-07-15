@@ -6,12 +6,14 @@
 //! balance-aware, health-aware, breaker-aware selection; the seam is here so the
 //! pipeline core never has to change.
 
+use std::time::Duration;
+
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::{Request, Response, Uri};
 
-use crate::config::Upstream;
+use crate::config::{Gateway, Route, Upstream};
 use crate::error::{BoxBody, BoxError, GatewayError};
 use crate::pipeline::RequestCtx;
 
@@ -19,12 +21,12 @@ use crate::pipeline::RequestCtx;
 ///
 /// Consumes the [`RequestCtx`] — this is the terminal step of the pipeline, so
 /// it takes ownership of the request body. `tail` (the post-prefix remainder) is
-/// carried for P1 `strip_prefix`; P0 forwards the original path+query unchanged.
+/// used by `strip_prefix` (P1); otherwise the original path+query is forwarded.
 pub async fn proxy(ctx: RequestCtx) -> Result<Response<BoxBody>, GatewayError> {
     let RequestCtx {
         state,
         route_index,
-        tail: _tail,
+        tail,
         req,
         ..
     } = ctx;
@@ -32,12 +34,21 @@ pub async fn proxy(ctx: RequestCtx) -> Result<Response<BoxBody>, GatewayError> {
     let route = &state.config.routes[route_index];
     let base = select_upstream(&route.upstream)?;
 
-    // Preserve the full original path + query (P0). strip_prefix is P1.
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    // Build the forwarded path. `strip_prefix` swaps the matched prefix for the
+    // router `tail` (which the router already collapses to `/` on an exact
+    // match). The `tail` is path-only, so we re-attach the original query to
+    // preserve it; without strip, `path_and_query` already carries the query.
+    let path_and_query = if route.strip_prefix {
+        match req.uri().query() {
+            Some(q) => format!("{tail}?{q}"),
+            None => tail.clone(),
+        }
+    } else {
+        req.uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string())
+    };
     let uri_str = format!("{}{}", base.trim_end_matches('/'), path_and_query);
     let uri: Uri = uri_str
         .parse()
@@ -68,7 +79,20 @@ pub async fn proxy(ctx: RequestCtx) -> Result<Response<BoxBody>, GatewayError> {
         .body(body.map_err(|e| Box::new(e) as BoxError).boxed_unsync())
         .map_err(|e| GatewayError::BadGateway(format!("building upstream request: {e}")))?;
 
-    match state.client.request(upstream_req).await {
+    // Per-attempt timeout: bounds a single upstream call, not the whole request.
+    // P2 retry adds an *overall* wall-clock budget spanning every attempt (the
+    // timeout+retry seam) — this stays per attempt. With no effective timeout
+    // configured we await the call unbounded.
+    let call = state.client.request(upstream_req);
+    let result = match effective_timeout(route, &state.config.gateway) {
+        Some(dur) => match tokio::time::timeout(dur, call).await {
+            Ok(inner) => inner,
+            Err(_elapsed) => return Err(GatewayError::GatewayTimeout),
+        },
+        None => call.await,
+    };
+
+    match result {
         Ok(resp) => Ok(relay_response(resp)),
         Err(e) => {
             // Detailed transport error is logged, not leaked to the client.
@@ -76,6 +100,16 @@ pub async fn proxy(ctx: RequestCtx) -> Result<Response<BoxBody>, GatewayError> {
             Err(GatewayError::BadGateway(e.to_string()))
         }
     }
+}
+
+/// Resolve the per-attempt timeout, first-present-wins: a route-level `timeout`
+/// beats an `upstream.timeout`, which beats the gateway `global_timeout`. When
+/// none is set anywhere the call is left unbounded (returns `None`).
+fn effective_timeout(route: &Route, gateway: &Gateway) -> Option<Duration> {
+    route
+        .timeout
+        .or(route.upstream.timeout)
+        .or(gateway.global_timeout)
 }
 
 /// Relay an upstream response: keep status + end-to-end headers + body, drop
